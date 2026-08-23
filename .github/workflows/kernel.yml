@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [v5.15, v6.1, v6.6, v6.8]
+        kernel: [v4.19, v5.15, v6.1, v6.6, v6.8]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -21,5 +21,5 @@ jobs:
         with:
           ruby-version: '3.4'
           bundler-cache: true
-      - run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 virtme-ng
+      - run: sudo apt-get update && sudo apt-get install -y busybox-static qemu-system-x86 virtme-ng
       - run: vng -v -r ${{ matrix.kernel }} -- bundle exec rake compile test:system
