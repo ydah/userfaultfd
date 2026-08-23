@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -21,6 +23,7 @@ typedef struct {
     int fd;
     pid_t pid;
     uint64_t features;
+    uint64_t enabled_features;
     uint64_t ioctls;
     uintptr_t registered_start;
     size_t registered_length;
@@ -32,10 +35,51 @@ typedef struct {
     size_t size;
     size_t page_size;
     int busy;
+    int shared;
 } region_data_t;
+
+typedef struct {
+    VALUE owner;
+    VALUE source;
+    pthread_t thread;
+    int stop_pipe[2];
+    int source_fd;
+    int started;
+    int running;
+    int joined;
+    int error;
+    int mode;
+    int uffd_fd;
+    uintptr_t start;
+    size_t length;
+    size_t page_size;
+    const void *source_address;
+} native_handler_data_t;
+
+#define EVENT_READER_MAX_FDS 64
+typedef struct {
+    VALUE owner;
+    pthread_t thread;
+    int stop_pipe[2];
+    int output_pipe[2];
+    int fds[EVENT_READER_MAX_FDS];
+    unsigned char owned[EVENT_READER_MAX_FDS];
+    size_t fd_count;
+    int started;
+    int joined;
+    int running;
+    int error;
+} event_reader_data_t;
 
 static VALUE cUserfaultFD;
 static VALUE cRegion;
+static VALUE cFault;
+static VALUE cForkEvent;
+static VALUE cRemapEvent;
+static VALUE cRemoveEvent;
+static VALUE cUnmapEvent;
+static VALUE cNativeHandler;
+static VALUE cEventReader;
 static VALUE eError;
 static VALUE eUnsupportedError;
 
@@ -45,6 +89,12 @@ static ID id_huge;
 static ID id_features;
 static ID id_mode;
 static ID id_enabled;
+static ID id_wake;
+
+void userfaultfd_define_constants(VALUE klass);
+
+static void native_handler_stop_and_join(native_handler_data_t *data);
+static void event_reader_stop_and_join(event_reader_data_t *data);
 
 static void
 uffd_free(void *ptr)
@@ -85,6 +135,102 @@ static const rb_data_type_t region_type = {
     {NULL, region_free, region_memsize, NULL},
     NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
 };
+
+static void
+native_handler_mark(void *ptr)
+{
+    native_handler_data_t *data = ptr;
+    rb_gc_mark(data->owner);
+    rb_gc_mark(data->source);
+}
+
+static void
+native_handler_free(void *ptr)
+{
+    native_handler_data_t *data = ptr;
+    native_handler_stop_and_join(data);
+    if (data->stop_pipe[0] >= 0) close(data->stop_pipe[0]);
+    if (data->stop_pipe[1] >= 0) close(data->stop_pipe[1]);
+    if (data->source_fd >= 0) close(data->source_fd);
+    xfree(data);
+}
+
+static size_t
+native_handler_memsize(const void *ptr)
+{
+    return ptr ? sizeof(native_handler_data_t) : 0;
+}
+
+static const rb_data_type_t native_handler_type = {
+    "UserfaultFD::NativeHandler",
+    {native_handler_mark, native_handler_free, native_handler_memsize, NULL},
+    NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
+};
+
+static VALUE
+native_handler_alloc(VALUE klass)
+{
+    native_handler_data_t *data;
+    VALUE object = TypedData_Make_Struct(
+        klass, native_handler_data_t, &native_handler_type, data
+    );
+    data->owner = Qnil;
+    data->source = Qnil;
+    data->stop_pipe[0] = -1;
+    data->stop_pipe[1] = -1;
+    data->source_fd = -1;
+    return object;
+}
+
+static void
+event_reader_mark(void *ptr)
+{
+    event_reader_data_t *data = ptr;
+    rb_gc_mark(data->owner);
+}
+
+static void
+event_reader_free(void *ptr)
+{
+    event_reader_data_t *data = ptr;
+    size_t i;
+    event_reader_stop_and_join(data);
+    for (i = 0; i < data->fd_count; i++) {
+        if (data->owned[i] && data->fds[i] >= 0) close(data->fds[i]);
+    }
+    if (data->stop_pipe[0] >= 0) close(data->stop_pipe[0]);
+    if (data->stop_pipe[1] >= 0) close(data->stop_pipe[1]);
+    if (data->output_pipe[0] >= 0) close(data->output_pipe[0]);
+    if (data->output_pipe[1] >= 0) close(data->output_pipe[1]);
+    xfree(data);
+}
+
+static size_t
+event_reader_memsize(const void *ptr)
+{
+    return ptr ? sizeof(event_reader_data_t) : 0;
+}
+
+static const rb_data_type_t event_reader_type = {
+    "UserfaultFD::EventReader",
+    {event_reader_mark, event_reader_free, event_reader_memsize, NULL},
+    NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY | RUBY_TYPED_WB_PROTECTED
+};
+
+static VALUE
+event_reader_alloc(VALUE klass)
+{
+    event_reader_data_t *data;
+    VALUE object = TypedData_Make_Struct(
+        klass, event_reader_data_t, &event_reader_type, data
+    );
+    size_t i;
+    data->owner = Qnil;
+    data->stop_pipe[0] = data->stop_pipe[1] = -1;
+    data->output_pipe[0] = data->output_pipe[1] = -1;
+    for (i = 0; i < EVENT_READER_MAX_FDS; i++) data->fds[i] = -1;
+    return object;
+}
 
 static VALUE
 uffd_alloc(VALUE klass)
@@ -274,6 +420,7 @@ uffd_initialize(int argc, VALUE *argv, VALUE self)
     VALUE kwargs = Qnil;
     VALUE values[1] = {Qundef};
     uint64_t requested = 0;
+    int features_given = 0;
     uffd_data_t *data;
 
     rb_scan_args(argc, argv, "0:", &kwargs);
@@ -281,6 +428,7 @@ uffd_initialize(int argc, VALUE *argv, VALUE self)
         ID keys[] = {id_features};
         rb_get_kwargs(kwargs, keys, 0, 1, values);
         if (values[0] != Qundef) {
+            features_given = 1;
 #ifdef __linux__
             requested = feature_mask(values[0]);
 #else
@@ -309,22 +457,34 @@ uffd_initialize(int argc, VALUE *argv, VALUE self)
             rb_syserr_fail(saved_errno, "UFFDIO_API");
         }
         close(probe_fd);
+#ifdef UFFD_FEATURE_EVENT_FORK
+        if (!features_given) requested = available & UFFD_FEATURE_EVENT_FORK;
+#else
+        (void)features_given;
+#endif
         if ((requested & available) != requested)
             raise_unsupported("requested userfaultfd features are unavailable");
 
+open_production_fd:
         data->fd = open_uffd(&data->backend);
         if (data->fd < 0) rb_syserr_fail(errno, "userfaultfd");
         if (query_api(data->fd, requested, &data->features, &data->ioctls) < 0) {
             saved_errno = errno;
             close(data->fd);
             data->fd = -1;
+            if (!features_given && requested && saved_errno == EPERM) {
+                requested = 0;
+                goto open_production_fd;
+            }
             if (saved_errno == EINVAL)
                 raise_unsupported("requested userfaultfd features were rejected");
             rb_syserr_fail(saved_errno, "UFFDIO_API");
         }
+        data->enabled_features = requested;
     }
 #else
     (void)requested;
+    (void)features_given;
     raise_unsupported("userfaultfd is only available on Linux");
 #endif
     return self;
@@ -388,6 +548,18 @@ uffd_instance_features(VALUE self)
 }
 
 static VALUE
+uffd_enabled_features(VALUE self)
+{
+    uffd_data_t *data = get_uffd(self);
+#ifdef __linux__
+    return features_to_array(data->enabled_features);
+#else
+    (void)data;
+    return rb_ary_new();
+#endif
+}
+
+static VALUE
 uffd_backend(VALUE self)
 {
     uffd_data_t *data = get_uffd(self);
@@ -438,6 +610,7 @@ region_initialize(int argc, VALUE *argv, VALUE self)
         rb_raise(rb_eArgError, "size must be a positive multiple of page_size");
 
     flags = (values[1] == Qfalse ? MAP_PRIVATE : MAP_SHARED) | MAP_ANONYMOUS;
+    data->shared = values[1] != Qfalse;
     if (values[2] == Qtrue) {
 #ifdef MAP_HUGETLB
         flags |= MAP_HUGETLB;
@@ -563,8 +736,14 @@ region_madvise(VALUE self, VALUE advice)
     region_data_t *data = get_region(self);
     if (advice != ID2SYM(rb_intern("dontneed")))
         rb_raise(rb_eArgError, "unknown advice");
-    if (madvise(data->address, data->size, MADV_DONTNEED) < 0)
-        rb_syserr_fail(errno, "madvise");
+    {
+        int native_advice = MADV_DONTNEED;
+#ifdef MADV_REMOVE
+        if (data->shared) native_advice = MADV_REMOVE;
+#endif
+        if (madvise(data->address, data->size, native_advice) < 0)
+            rb_syserr_fail(errno, "madvise");
+    }
     return Qnil;
 }
 
@@ -612,6 +791,7 @@ uffd_register(int argc, VALUE *argv, VALUE self)
             rb_syserr_fail(errno, "UFFDIO_REGISTER");
         data->registered_start = (uintptr_t)region->address;
         data->registered_length = region->size;
+        rb_ivar_set(self, rb_intern("@registered_region"), region_object);
         return ULL2NUM(request.ioctls);
     }
 #else
@@ -635,6 +815,7 @@ uffd_unregister(VALUE self, VALUE region_object)
         if (data->registered_start == (uintptr_t)region->address) {
             data->registered_start = 0;
             data->registered_length = 0;
+            rb_ivar_set(self, rb_intern("@registered_region"), Qnil);
         }
     }
 #else
@@ -672,6 +853,843 @@ uffd_writeprotect(int argc, VALUE *argv, VALUE self)
     return Qnil;
 }
 
+#ifdef __linux__
+struct read_args {
+    int fd;
+    void *buffer;
+    size_t length;
+    ssize_t result;
+    int error;
+};
+
+static void *
+without_gvl_read(void *ptr)
+{
+    struct read_args *args = ptr;
+    args->result = read(args->fd, args->buffer, args->length);
+    args->error = errno;
+    return NULL;
+}
+
+struct ioctl_args {
+    int fd;
+    unsigned long request;
+    void *argument;
+    int result;
+    int error;
+};
+
+static void *
+without_gvl_ioctl(void *ptr)
+{
+    struct ioctl_args *args = ptr;
+    args->result = ioctl(args->fd, args->request, args->argument);
+    args->error = errno;
+    return NULL;
+}
+
+static void
+run_ioctl_without_gvl(int fd, unsigned long request, void *argument, const char *name)
+{
+    struct ioctl_args args = {fd, request, argument, 0, 0};
+    rb_thread_call_without_gvl(without_gvl_ioctl, &args, RUBY_UBF_IO, NULL);
+    if (args.result < 0) rb_syserr_fail(args.error, name);
+}
+
+static VALUE
+new_event(VALUE klass)
+{
+    return rb_obj_alloc(klass);
+}
+
+static VALUE
+new_fault(VALUE owner, const struct uffd_msg *message)
+{
+    VALUE event = new_event(cFault);
+    VALUE flags = rb_ary_new();
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t address = (uintptr_t)message->arg.pagefault.address;
+    address &= ~((uintptr_t)page_size - 1);
+    if (message->arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WRITE)
+        rb_ary_push(flags, ID2SYM(rb_intern("write")));
+#ifdef UFFD_PAGEFAULT_FLAG_WP
+    if (message->arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP)
+        rb_ary_push(flags, ID2SYM(rb_intern("wp")));
+#endif
+#ifdef UFFD_PAGEFAULT_FLAG_MINOR
+    if (message->arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_MINOR)
+        rb_ary_push(flags, ID2SYM(rb_intern("minor")));
+#endif
+    rb_ivar_set(event, rb_intern("@owner"), owner);
+    rb_ivar_set(event, rb_intern("@address"), ULL2NUM(address));
+    rb_ivar_set(event, rb_intern("@flags"), flags);
+    rb_ivar_set(event, rb_intern("@page_size"), SIZET2NUM(page_size));
+#ifdef UFFD_FEATURE_THREAD_ID
+    rb_ivar_set(event, rb_intern("@thread_id"),
+                UINT2NUM(message->arg.pagefault.feat.ptid));
+#else
+    rb_ivar_set(event, rb_intern("@thread_id"), Qnil);
+#endif
+    return event;
+}
+
+static VALUE
+wrap_child_uffd(VALUE owner, int fd)
+{
+    uffd_data_t *parent = get_uffd(owner);
+    uffd_data_t *child;
+    VALUE object = uffd_alloc(cUserfaultFD);
+    TypedData_Get_Struct(object, uffd_data_t, &uffd_type, child);
+    child->fd = fd;
+    child->pid = getpid();
+    child->features = parent->features;
+    child->enabled_features = parent->enabled_features;
+    child->ioctls = parent->ioctls;
+    child->backend = parent->backend;
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return object;
+}
+
+static VALUE
+parse_event(VALUE owner, const struct uffd_msg *message)
+{
+    VALUE event;
+    switch (message->event) {
+      case UFFD_EVENT_PAGEFAULT:
+        return new_fault(owner, message);
+#ifdef UFFD_EVENT_FORK
+      case UFFD_EVENT_FORK:
+        event = new_event(cForkEvent);
+        rb_ivar_set(event, rb_intern("@child_uffd"),
+                    wrap_child_uffd(owner, (int)message->arg.fork.ufd));
+        return event;
+#endif
+#ifdef UFFD_EVENT_REMAP
+      case UFFD_EVENT_REMAP:
+        event = new_event(cRemapEvent);
+        rb_ivar_set(event, rb_intern("@from"), ULL2NUM(message->arg.remap.from));
+        rb_ivar_set(event, rb_intern("@to"), ULL2NUM(message->arg.remap.to));
+        rb_ivar_set(event, rb_intern("@length"), ULL2NUM(message->arg.remap.len));
+        return event;
+#endif
+#ifdef UFFD_EVENT_REMOVE
+      case UFFD_EVENT_REMOVE:
+        event = new_event(cRemoveEvent);
+        rb_ivar_set(event, rb_intern("@start"), ULL2NUM(message->arg.remove.start));
+        rb_ivar_set(event, rb_intern("@end"), ULL2NUM(message->arg.remove.end));
+        return event;
+#endif
+#ifdef UFFD_EVENT_UNMAP
+      case UFFD_EVENT_UNMAP:
+        event = new_event(cUnmapEvent);
+        rb_ivar_set(event, rb_intern("@start"), ULL2NUM(message->arg.remove.start));
+        rb_ivar_set(event, rb_intern("@end"), ULL2NUM(message->arg.remove.end));
+        return event;
+#endif
+      default:
+        return Qnil;
+    }
+}
+#endif
+
+static VALUE
+uffd_read_events(int argc, VALUE *argv, VALUE self)
+{
+    VALUE max_value = Qnil;
+    uffd_data_t *data = get_uffd(self);
+    size_t maximum = 16;
+    rb_scan_args(argc, argv, "01", &max_value);
+    if (!NIL_P(max_value)) maximum = NUM2SIZET(max_value);
+    if (maximum == 0 || maximum > 1024)
+        rb_raise(rb_eArgError, "max must be between 1 and 1024");
+#ifdef __linux__
+    {
+        struct uffd_msg *messages = ALLOC_N(struct uffd_msg, maximum);
+        struct read_args args = {
+            data->fd, messages, sizeof(struct uffd_msg) * maximum, 0, 0
+        };
+        VALUE result = rb_ary_new();
+        size_t count, i;
+        rb_thread_call_without_gvl(without_gvl_read, &args, RUBY_UBF_IO, NULL);
+        if (args.result < 0) {
+            xfree(messages);
+            if (args.error == EAGAIN || args.error == EINTR) return result;
+            rb_syserr_fail(args.error, "read(userfaultfd)");
+        }
+        if ((size_t)args.result % sizeof(struct uffd_msg) != 0) {
+            xfree(messages);
+            rb_raise(eError, "short userfaultfd message");
+        }
+        count = (size_t)args.result / sizeof(struct uffd_msg);
+        for (i = 0; i < count; i++) {
+            VALUE event = parse_event(self, &messages[i]);
+            if (!NIL_P(event)) rb_ary_push(result, event);
+        }
+        xfree(messages);
+        return result;
+    }
+#else
+    (void)data;
+    raise_unsupported("userfaultfd is only available on Linux");
+#endif
+}
+
+static uffd_data_t *
+fault_owner(VALUE self)
+{
+    return get_uffd(rb_ivar_get(self, rb_intern("@owner")));
+}
+
+#ifdef __linux__
+static uintptr_t
+fault_address(VALUE self)
+{
+    return (uintptr_t)NUM2ULL(rb_ivar_get(self, rb_intern("@address")));
+}
+#endif
+
+static size_t
+fault_page_size(VALUE self)
+{
+    return NUM2SIZET(rb_ivar_get(self, rb_intern("@page_size")));
+}
+
+static int
+wake_requested(VALUE kwargs)
+{
+    VALUE values[1] = {Qundef};
+    ID keys[] = {id_wake};
+    if (NIL_P(kwargs)) return 1;
+    rb_get_kwargs(kwargs, keys, 0, 1, values);
+    return values[0] == Qundef || values[0] != Qfalse;
+}
+
+static VALUE
+fault_copy(int argc, VALUE *argv, VALUE self)
+{
+    VALUE string, kwargs;
+    uffd_data_t *owner = fault_owner(self);
+    size_t length, page_size = fault_page_size(self);
+    char *buffer;
+    int wake;
+    rb_scan_args(argc, argv, "1:", &string, &kwargs);
+    StringValue(string);
+    length = (size_t)RSTRING_LEN(string);
+    if (length == 0 || length % page_size != 0)
+        rb_raise(rb_eArgError, "copy length must be a positive multiple of page_size");
+    wake = wake_requested(kwargs);
+#ifdef __linux__
+    {
+        struct uffdio_copy request;
+        buffer = xmalloc(length);
+        memcpy(buffer, RSTRING_PTR(string), length);
+        memset(&request, 0, sizeof(request));
+        request.dst = (uint64_t)fault_address(self);
+        request.src = (uint64_t)(uintptr_t)buffer;
+        request.len = length;
+        request.mode = wake ? 0 : UFFDIO_COPY_MODE_DONTWAKE;
+        {
+            struct ioctl_args args = {
+                owner->fd, UFFDIO_COPY, &request, 0, 0
+            };
+            rb_thread_call_without_gvl(without_gvl_ioctl, &args, RUBY_UBF_IO, NULL);
+            if (args.result < 0) {
+                int saved_errno = args.error;
+                xfree(buffer);
+                rb_syserr_fail(saved_errno, "UFFDIO_COPY");
+            }
+        }
+        xfree(buffer);
+        if (request.copy < 0) rb_syserr_fail((int)-request.copy, "UFFDIO_COPY");
+        return LL2NUM(request.copy);
+    }
+#else
+    (void)owner; (void)buffer; (void)wake;
+    raise_unsupported("userfaultfd is only available on Linux");
+#endif
+}
+
+static VALUE
+fault_zero(int argc, VALUE *argv, VALUE self)
+{
+    VALUE kwargs;
+    uffd_data_t *owner = fault_owner(self);
+    int wake;
+    rb_scan_args(argc, argv, "0:", &kwargs);
+    wake = wake_requested(kwargs);
+#ifdef __linux__
+    {
+        struct uffdio_zeropage request;
+        memset(&request, 0, sizeof(request));
+        request.range.start = (uint64_t)fault_address(self);
+        request.range.len = fault_page_size(self);
+        request.mode = wake ? 0 : UFFDIO_ZEROPAGE_MODE_DONTWAKE;
+        run_ioctl_without_gvl(owner->fd, UFFDIO_ZEROPAGE, &request, "UFFDIO_ZEROPAGE");
+        if (request.zeropage < 0)
+            rb_syserr_fail((int)-request.zeropage, "UFFDIO_ZEROPAGE");
+        return LL2NUM(request.zeropage);
+    }
+#else
+    (void)owner; (void)wake;
+    raise_unsupported("userfaultfd is only available on Linux");
+#endif
+}
+
+static VALUE
+fault_wake(VALUE self)
+{
+    uffd_data_t *owner = fault_owner(self);
+#ifdef __linux__
+    {
+        struct uffdio_range range;
+        range.start = (uint64_t)fault_address(self);
+        range.len = fault_page_size(self);
+        run_ioctl_without_gvl(owner->fd, UFFDIO_WAKE, &range, "UFFDIO_WAKE");
+    }
+#else
+    (void)owner;
+    raise_unsupported("userfaultfd is only available on Linux");
+#endif
+    return Qnil;
+}
+
+static VALUE
+fault_continue(int argc, VALUE *argv, VALUE self)
+{
+    VALUE kwargs;
+    uffd_data_t *owner = fault_owner(self);
+    int wake;
+    rb_scan_args(argc, argv, "0:", &kwargs);
+    wake = wake_requested(kwargs);
+#if defined(__linux__) && defined(UFFDIO_CONTINUE)
+    {
+        struct uffdio_continue request;
+        memset(&request, 0, sizeof(request));
+        request.range.start = (uint64_t)fault_address(self);
+        request.range.len = fault_page_size(self);
+        request.mode = wake ? 0 : UFFDIO_CONTINUE_MODE_DONTWAKE;
+        run_ioctl_without_gvl(owner->fd, UFFDIO_CONTINUE, &request, "UFFDIO_CONTINUE");
+        if (request.mapped < 0)
+            rb_syserr_fail((int)-request.mapped, "UFFDIO_CONTINUE");
+        return LL2NUM(request.mapped);
+    }
+#else
+    (void)owner; (void)wake;
+    raise_unsupported("UFFDIO_CONTINUE is unavailable on this platform");
+#endif
+}
+
+static VALUE
+fault_poison(int argc, VALUE *argv, VALUE self)
+{
+    VALUE kwargs;
+    uffd_data_t *owner = fault_owner(self);
+    int wake;
+    rb_scan_args(argc, argv, "0:", &kwargs);
+    wake = wake_requested(kwargs);
+#if defined(__linux__) && defined(UFFDIO_POISON)
+    {
+        struct uffdio_poison request;
+        memset(&request, 0, sizeof(request));
+        request.range.start = (uint64_t)fault_address(self);
+        request.range.len = fault_page_size(self);
+        request.mode = wake ? 0 : UFFDIO_POISON_MODE_DONTWAKE;
+        run_ioctl_without_gvl(owner->fd, UFFDIO_POISON, &request, "UFFDIO_POISON");
+        if (request.updated < 0)
+            rb_syserr_fail((int)-request.updated, "UFFDIO_POISON");
+        return LL2NUM(request.updated);
+    }
+#else
+    (void)owner; (void)wake;
+    raise_unsupported("UFFDIO_POISON is unavailable on this platform");
+#endif
+}
+
+#ifdef __linux__
+static int
+fill_from_file(native_handler_data_t *data, void *buffer, off_t offset)
+{
+    size_t done = 0;
+    memset(buffer, 0, data->page_size);
+    while (done < data->page_size) {
+        ssize_t count = pread(data->source_fd, (char *)buffer + done,
+                              data->page_size - done, offset + (off_t)done);
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        done += (size_t)count;
+    }
+    return 0;
+}
+
+static int
+native_resolve_fault(native_handler_data_t *data, const struct uffd_msg *message,
+                     void *buffer)
+{
+    uintptr_t address = (uintptr_t)message->arg.pagefault.address;
+    uintptr_t offset;
+    address &= ~((uintptr_t)data->page_size - 1);
+    if (address < data->start || address >= data->start + data->length) {
+        errno = EFAULT;
+        return -1;
+    }
+    offset = address - data->start;
+    if (data->mode == 1) {
+        struct uffdio_zeropage request;
+        memset(&request, 0, sizeof(request));
+        request.range.start = address;
+        request.range.len = data->page_size;
+        return ioctl(data->uffd_fd, UFFDIO_ZEROPAGE, &request);
+    }
+
+    if (data->mode == 2 && fill_from_file(data, buffer, (off_t)offset) < 0)
+        return -1;
+    if (data->mode == 3)
+        memcpy(buffer, (const char *)data->source_address + offset, data->page_size);
+
+    {
+        struct uffdio_copy request;
+        memset(&request, 0, sizeof(request));
+        request.dst = address;
+        request.src = (uint64_t)(uintptr_t)buffer;
+        request.len = data->page_size;
+        return ioctl(data->uffd_fd, UFFDIO_COPY, &request);
+    }
+}
+
+static void *
+native_handler_main(void *ptr)
+{
+    native_handler_data_t *data = ptr;
+    struct pollfd fds[2];
+    struct uffd_msg messages[16];
+    void *buffer = NULL;
+    if (data->mode != 1) {
+        buffer = malloc(data->page_size);
+        if (!buffer) {
+            data->error = ENOMEM;
+            data->running = 0;
+            return NULL;
+        }
+    }
+    fds[0].fd = data->uffd_fd;
+    fds[0].events = POLLIN;
+    fds[1].fd = data->stop_pipe[0];
+    fds[1].events = POLLIN;
+    while (1) {
+        int ready = poll(fds, 2, -1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            data->error = errno;
+            break;
+        }
+        if (fds[1].revents) break;
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            data->error = EIO;
+            break;
+        }
+        if (fds[0].revents & POLLIN) {
+            ssize_t count = read(data->uffd_fd, messages, sizeof(messages));
+            size_t i, length;
+            if (count < 0) {
+                if (errno == EAGAIN || errno == EINTR) continue;
+                data->error = errno;
+                break;
+            }
+            if ((size_t)count % sizeof(struct uffd_msg) != 0) {
+                data->error = EIO;
+                break;
+            }
+            length = (size_t)count / sizeof(struct uffd_msg);
+            for (i = 0; i < length; i++) {
+                if (messages[i].event == UFFD_EVENT_PAGEFAULT) {
+                    if (native_resolve_fault(data, &messages[i], buffer) < 0) {
+                        data->error = errno;
+                        goto done;
+                    }
+                }
+#ifdef UFFD_EVENT_FORK
+                else if (messages[i].event == UFFD_EVENT_FORK) {
+                    close((int)messages[i].arg.fork.ufd);
+                }
+#endif
+            }
+        }
+    }
+done:
+    free(buffer);
+    data->running = 0;
+    return NULL;
+}
+#endif
+
+struct join_args {
+    pthread_t thread;
+    int result;
+};
+
+static void *
+without_gvl_join(void *ptr)
+{
+    struct join_args *args = ptr;
+    args->result = pthread_join(args->thread, NULL);
+    return NULL;
+}
+
+static void
+native_handler_stop_and_join(native_handler_data_t *data)
+{
+    struct join_args args;
+    char byte = 0;
+    if (data->joined || !data->started) return;
+    if (data->stop_pipe[1] >= 0) (void)write(data->stop_pipe[1], &byte, 1);
+    args.thread = data->thread;
+    args.result = 0;
+    if (ruby_native_thread_p())
+        rb_thread_call_without_gvl(without_gvl_join, &args, RUBY_UBF_IO, NULL);
+    else
+        args.result = pthread_join(args.thread, NULL);
+    data->joined = 1;
+    data->running = 0;
+}
+
+static VALUE
+uffd_start_native_handler(VALUE self, VALUE mode, VALUE source)
+{
+    uffd_data_t *owner = get_uffd(self);
+    native_handler_data_t *data;
+    VALUE object;
+    if (!owner->registered_start || !owner->registered_length)
+        rb_raise(eError, "register a region before starting a native handler");
+    object = native_handler_alloc(cNativeHandler);
+    TypedData_Get_Struct(object, native_handler_data_t, &native_handler_type, data);
+    data->owner = self;
+    data->source = source;
+    data->uffd_fd = owner->fd;
+    data->start = owner->registered_start;
+    data->length = owner->registered_length;
+    data->page_size = (size_t)sysconf(_SC_PAGESIZE);
+    if (mode == ID2SYM(rb_intern("zero_fill"))) {
+        data->mode = 1;
+    } else if (mode == ID2SYM(rb_intern("backing_file"))) {
+        VALUE fd;
+        if (NIL_P(source)) rb_raise(rb_eArgError, "io is required for backing_file");
+        fd = rb_funcall(source, rb_intern("fileno"), 0);
+        data->source_fd = dup(NUM2INT(fd));
+        if (data->source_fd < 0) rb_syserr_fail(errno, "dup");
+        data->mode = 2;
+    } else if (mode == ID2SYM(rb_intern("prefilled"))) {
+        region_data_t *region;
+        if (NIL_P(source)) rb_raise(rb_eArgError, "source is required for prefilled");
+        region = get_region(source);
+        if (region->size < data->length)
+            rb_raise(rb_eArgError, "source region is smaller than registered region");
+        data->source_address = region->address;
+        data->mode = 3;
+    } else {
+        rb_raise(rb_eArgError, "unknown native handler mode");
+    }
+#ifdef __linux__
+    if (pipe(data->stop_pipe) < 0) rb_syserr_fail(errno, "pipe");
+    fcntl(data->stop_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(data->stop_pipe[1], F_SETFD, FD_CLOEXEC);
+    data->running = 1;
+    if (pthread_create(&data->thread, NULL, native_handler_main, data) != 0) {
+        data->running = 0;
+        rb_raise(eError, "failed to start native handler thread");
+    }
+    data->started = 1;
+#else
+    raise_unsupported("native handlers are only available on Linux");
+#endif
+    return object;
+}
+
+static VALUE
+native_handler_stop(VALUE self)
+{
+    native_handler_data_t *data;
+    TypedData_Get_Struct(self, native_handler_data_t, &native_handler_type, data);
+    native_handler_stop_and_join(data);
+    if (data->error) rb_syserr_fail(data->error, "userfaultfd handler");
+    return self;
+}
+
+static VALUE
+native_handler_running_p(VALUE self)
+{
+    native_handler_data_t *data;
+    TypedData_Get_Struct(self, native_handler_data_t, &native_handler_type, data);
+    return data->running ? Qtrue : Qfalse;
+}
+
+#ifdef __linux__
+struct event_record {
+    int source_fd;
+    struct uffd_msg message;
+};
+
+static void
+event_reader_remove_fd(event_reader_data_t *data, size_t index)
+{
+    size_t i;
+    if (data->owned[index]) close(data->fds[index]);
+    for (i = index + 1; i < data->fd_count; i++) {
+        data->fds[i - 1] = data->fds[i];
+        data->owned[i - 1] = data->owned[i];
+    }
+    data->fd_count--;
+}
+
+static int
+event_reader_emit(event_reader_data_t *data, int source_fd,
+                  const struct uffd_msg *message)
+{
+    struct event_record record;
+    ssize_t written;
+    record.source_fd = source_fd;
+    record.message = *message;
+    do {
+        written = write(data->output_pipe[1], &record, sizeof(record));
+    } while (written < 0 && errno == EINTR);
+    if (written == (ssize_t)sizeof(record)) return 0;
+    data->error = written < 0 && errno != EAGAIN ? errno : ENOBUFS;
+    return -1;
+}
+
+static void *
+event_reader_main(void *ptr)
+{
+    event_reader_data_t *data = ptr;
+    /* ponytail: 64 monitored processes; use epoll if larger fan-out is needed. */
+    struct pollfd poll_fds[EVENT_READER_MAX_FDS + 1];
+    while (1) {
+        size_t i, polled_count = data->fd_count;
+        int ready;
+        for (i = 0; i < polled_count; i++) {
+            poll_fds[i].fd = data->fds[i];
+            poll_fds[i].events = POLLIN;
+            poll_fds[i].revents = 0;
+        }
+        poll_fds[polled_count].fd = data->stop_pipe[0];
+        poll_fds[polled_count].events = POLLIN;
+        poll_fds[polled_count].revents = 0;
+        ready = poll(poll_fds, polled_count + 1, -1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            data->error = errno;
+            break;
+        }
+        if (poll_fds[polled_count].revents) break;
+        for (i = 0; i < polled_count; i++) {
+            if (poll_fds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                if (i == 0) {
+                    data->error = EIO;
+                    goto done;
+                }
+                event_reader_remove_fd(data, i);
+                goto repoll;
+            }
+            if (poll_fds[i].revents & POLLIN) {
+                struct uffd_msg messages[16];
+                ssize_t count = read(data->fds[i], messages, sizeof(messages));
+                size_t j, length;
+                if (count < 0) {
+                    if (errno == EAGAIN || errno == EINTR) {
+                        continue;
+                    }
+                    data->error = errno;
+                    goto done;
+                }
+                if ((size_t)count % sizeof(struct uffd_msg) != 0) {
+                    data->error = EIO;
+                    goto done;
+                }
+                length = (size_t)count / sizeof(struct uffd_msg);
+                for (j = 0; j < length; j++) {
+#ifdef UFFD_EVENT_FORK
+                    if (messages[j].event == UFFD_EVENT_FORK) {
+                        int child_fd = (int)messages[j].arg.fork.ufd;
+                        if (data->fd_count == EVENT_READER_MAX_FDS) {
+                            close(child_fd);
+                            data->error = EMFILE;
+                            goto done;
+                        }
+                        fcntl(child_fd, F_SETFD, FD_CLOEXEC);
+                        fcntl(child_fd, F_SETFL,
+                              fcntl(child_fd, F_GETFL) | O_NONBLOCK);
+                        data->fds[data->fd_count] = child_fd;
+                        data->owned[data->fd_count] = 1;
+                        data->fd_count++;
+                    }
+#endif
+                    if (event_reader_emit(data, data->fds[i], &messages[j]) < 0)
+                        goto done;
+                }
+            }
+        }
+repoll:
+        ;
+    }
+done:
+    data->running = 0;
+    close(data->output_pipe[1]);
+    data->output_pipe[1] = -1;
+    return NULL;
+}
+#endif
+
+static void
+event_reader_stop_and_join(event_reader_data_t *data)
+{
+    struct join_args args;
+    char byte = 0;
+    if (data->joined || !data->started) return;
+    if (data->stop_pipe[1] >= 0) (void)write(data->stop_pipe[1], &byte, 1);
+    args.thread = data->thread;
+    args.result = 0;
+    if (ruby_native_thread_p())
+        rb_thread_call_without_gvl(without_gvl_join, &args, RUBY_UBF_IO, NULL);
+    else
+        args.result = pthread_join(args.thread, NULL);
+    data->joined = 1;
+    data->running = 0;
+}
+
+static VALUE
+uffd_start_event_reader(VALUE self)
+{
+    uffd_data_t *owner = get_uffd(self);
+    event_reader_data_t *data;
+    VALUE object = event_reader_alloc(cEventReader);
+    TypedData_Get_Struct(object, event_reader_data_t, &event_reader_type, data);
+    data->owner = self;
+    data->fds[0] = owner->fd;
+    data->owned[0] = 0;
+    data->fd_count = 1;
+    rb_ivar_set(object, rb_intern("@owners"), rb_hash_new());
+    rb_hash_aset(rb_ivar_get(object, rb_intern("@owners")),
+                 INT2NUM(owner->fd), self);
+#ifdef __linux__
+    if (pipe(data->stop_pipe) < 0 || pipe(data->output_pipe) < 0)
+        rb_syserr_fail(errno, "pipe");
+    fcntl(data->stop_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(data->stop_pipe[1], F_SETFD, FD_CLOEXEC);
+    fcntl(data->output_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(data->output_pipe[1], F_SETFD, FD_CLOEXEC);
+    fcntl(data->output_pipe[0], F_SETFL,
+          fcntl(data->output_pipe[0], F_GETFL) | O_NONBLOCK);
+    fcntl(data->output_pipe[1], F_SETFL,
+          fcntl(data->output_pipe[1], F_GETFL) | O_NONBLOCK);
+    data->running = 1;
+    if (pthread_create(&data->thread, NULL, event_reader_main, data) != 0) {
+        data->running = 0;
+        rb_raise(eError, "failed to start event reader thread");
+    }
+    data->started = 1;
+#else
+    raise_unsupported("event readers are only available on Linux");
+#endif
+    return object;
+}
+
+static VALUE
+event_reader_fileno(VALUE self)
+{
+    event_reader_data_t *data;
+    TypedData_Get_Struct(self, event_reader_data_t, &event_reader_type, data);
+    if (data->output_pipe[0] < 0) rb_raise(eError, "closed event reader");
+    return INT2NUM(data->output_pipe[0]);
+}
+
+static VALUE
+event_reader_read_events(int argc, VALUE *argv, VALUE self)
+{
+    VALUE max_value = Qnil;
+    event_reader_data_t *data;
+    size_t maximum = 16;
+    rb_scan_args(argc, argv, "01", &max_value);
+    if (!NIL_P(max_value)) maximum = NUM2SIZET(max_value);
+    if (maximum == 0 || maximum > 1024)
+        rb_raise(rb_eArgError, "max must be between 1 and 1024");
+    TypedData_Get_Struct(self, event_reader_data_t, &event_reader_type, data);
+#ifdef __linux__
+    {
+        struct event_record *records = ALLOC_N(struct event_record, maximum);
+        ssize_t count = read(data->output_pipe[0], records,
+                             sizeof(struct event_record) * maximum);
+        VALUE result = rb_ary_new();
+        VALUE owners = rb_ivar_get(self, rb_intern("@owners"));
+        size_t length, i;
+        if (count < 0) {
+            xfree(records);
+            if (errno == EAGAIN || errno == EINTR) return result;
+            rb_syserr_fail(errno, "read(userfaultfd event pipe)");
+        }
+        if (count == 0) {
+            xfree(records);
+            if (data->error) rb_syserr_fail(data->error, "userfaultfd event reader");
+            return result;
+        }
+        if ((size_t)count % sizeof(struct event_record) != 0) {
+            xfree(records);
+            rb_raise(eError, "short event-reader record");
+        }
+        length = (size_t)count / sizeof(struct event_record);
+        for (i = 0; i < length; i++) {
+            VALUE owner = rb_hash_aref(owners, INT2NUM(records[i].source_fd));
+            VALUE event;
+            if (NIL_P(owner)) {
+                xfree(records);
+                rb_raise(eError, "unknown userfaultfd event source");
+            }
+#ifdef UFFD_EVENT_FORK
+            if (records[i].message.event == UFFD_EVENT_FORK) {
+                int raw_fd = (int)records[i].message.arg.fork.ufd;
+                int duplicated = dup(raw_fd);
+                if (duplicated < 0) {
+                    xfree(records);
+                    rb_syserr_fail(errno, "dup(child userfaultfd)");
+                }
+                records[i].message.arg.fork.ufd = (uint32_t)duplicated;
+                event = parse_event(owner, &records[i].message);
+                rb_hash_aset(owners, INT2NUM(raw_fd),
+                             rb_ivar_get(event, rb_intern("@child_uffd")));
+            } else
+#endif
+            {
+                event = parse_event(owner, &records[i].message);
+            }
+            if (!NIL_P(event)) rb_ary_push(result, event);
+        }
+        xfree(records);
+        return result;
+    }
+#else
+    raise_unsupported("event readers are only available on Linux");
+#endif
+}
+
+static VALUE
+event_reader_stop(VALUE self)
+{
+    event_reader_data_t *data;
+    TypedData_Get_Struct(self, event_reader_data_t, &event_reader_type, data);
+    event_reader_stop_and_join(data);
+    if (data->error) rb_syserr_fail(data->error, "userfaultfd event reader");
+    return self;
+}
+
+static VALUE
+event_reader_running_p(VALUE self)
+{
+    event_reader_data_t *data;
+    TypedData_Get_Struct(self, event_reader_data_t, &event_reader_type, data);
+    return data->running ? Qtrue : Qfalse;
+}
+
 void
 Init_userfaultfd(void)
 {
@@ -686,12 +1704,14 @@ Init_userfaultfd(void)
     id_features = rb_intern("features");
     id_mode = rb_intern("mode");
     id_enabled = rb_intern("enabled");
+    id_wake = rb_intern("wake");
 
     rb_define_alloc_func(cUserfaultFD, uffd_alloc);
     rb_define_method(cUserfaultFD, "initialize", uffd_initialize, -1);
     rb_define_singleton_method(cUserfaultFD, "supported?", uffd_supported, 0);
     rb_define_singleton_method(cUserfaultFD, "features", uffd_features, 0);
     rb_define_method(cUserfaultFD, "features", uffd_instance_features, 0);
+    rb_define_method(cUserfaultFD, "enabled_features", uffd_enabled_features, 0);
     rb_define_method(cUserfaultFD, "backend", uffd_backend, 0);
     rb_define_method(cUserfaultFD, "fileno", uffd_fileno, 0);
     rb_define_method(cUserfaultFD, "close", uffd_close, 0);
@@ -699,6 +1719,11 @@ Init_userfaultfd(void)
     rb_define_method(cUserfaultFD, "register", uffd_register, -1);
     rb_define_method(cUserfaultFD, "unregister", uffd_unregister, 1);
     rb_define_method(cUserfaultFD, "writeprotect", uffd_writeprotect, -1);
+    rb_define_method(cUserfaultFD, "read_events", uffd_read_events, -1);
+    rb_define_private_method(cUserfaultFD, "start_native_handler",
+                             uffd_start_native_handler, 2);
+    rb_define_private_method(cUserfaultFD, "start_event_reader",
+                             uffd_start_event_reader, 0);
 
     rb_define_alloc_func(cRegion, region_alloc);
     rb_define_method(cRegion, "initialize", region_initialize, -1);
@@ -711,4 +1736,41 @@ Init_userfaultfd(void)
     rb_define_method(cRegion, "madvise", region_madvise, 1);
     rb_define_method(cRegion, "unmap", region_unmap, 0);
     rb_define_method(cRegion, "unmapped?", region_unmapped_p, 0);
+
+    cFault = rb_define_class_under(cUserfaultFD, "Fault", rb_cObject);
+    rb_define_attr(cFault, "address", 1, 0);
+    rb_define_attr(cFault, "flags", 1, 0);
+    rb_define_attr(cFault, "thread_id", 1, 0);
+    rb_define_method(cFault, "copy", fault_copy, -1);
+    rb_define_method(cFault, "zero", fault_zero, -1);
+    rb_define_method(cFault, "continue", fault_continue, -1);
+    rb_define_method(cFault, "poison", fault_poison, -1);
+    rb_define_method(cFault, "wake", fault_wake, 0);
+
+    cForkEvent = rb_define_class_under(cUserfaultFD, "ForkEvent", rb_cObject);
+    rb_define_attr(cForkEvent, "child_uffd", 1, 0);
+    cRemapEvent = rb_define_class_under(cUserfaultFD, "RemapEvent", rb_cObject);
+    rb_define_attr(cRemapEvent, "from", 1, 0);
+    rb_define_attr(cRemapEvent, "to", 1, 0);
+    rb_define_attr(cRemapEvent, "length", 1, 0);
+    cRemoveEvent = rb_define_class_under(cUserfaultFD, "RemoveEvent", rb_cObject);
+    rb_define_attr(cRemoveEvent, "start", 1, 0);
+    rb_define_attr(cRemoveEvent, "end", 1, 0);
+    cUnmapEvent = rb_define_class_under(cUserfaultFD, "UnmapEvent", rb_cObject);
+    rb_define_attr(cUnmapEvent, "start", 1, 0);
+    rb_define_attr(cUnmapEvent, "end", 1, 0);
+
+    cNativeHandler = rb_define_class_under(cUserfaultFD, "NativeHandler", rb_cObject);
+    rb_define_alloc_func(cNativeHandler, native_handler_alloc);
+    rb_define_method(cNativeHandler, "stop", native_handler_stop, 0);
+    rb_define_method(cNativeHandler, "running?", native_handler_running_p, 0);
+
+    cEventReader = rb_define_class_under(cUserfaultFD, "EventReader", rb_cObject);
+    rb_define_alloc_func(cEventReader, event_reader_alloc);
+    rb_define_method(cEventReader, "fileno", event_reader_fileno, 0);
+    rb_define_method(cEventReader, "read_events", event_reader_read_events, -1);
+    rb_define_method(cEventReader, "stop", event_reader_stop, 0);
+    rb_define_method(cEventReader, "running?", event_reader_running_p, 0);
+
+    userfaultfd_define_constants(cUserfaultFD);
 }
