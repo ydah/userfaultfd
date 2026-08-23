@@ -56,6 +56,8 @@ typedef struct {
     size_t length;
     size_t page_size;
     const void *source_address;
+    region_data_t *registered_region;
+    region_data_t *source_region;
 } native_handler_data_t;
 
 #define EVENT_READER_MAX_FDS 64
@@ -842,6 +844,7 @@ uffd_register(int argc, VALUE *argv, VALUE self)
     rb_scan_args(argc, argv, "1:", &region_object, &kwargs);
     rb_get_kwargs(kwargs, keys, 1, 0, values);
     region = get_region(region_object);
+    if (region->busy) rb_raise(eError, "region is in use");
 #ifdef __linux__
     {
         struct uffdio_register request;
@@ -885,6 +888,7 @@ uffd_unregister(VALUE self, VALUE region_object)
 {
     uffd_data_t *data = get_uffd(self);
     region_data_t *region = get_region(region_object);
+    if (region->busy) rb_raise(eError, "region is in use");
 #ifdef __linux__
     {
         struct uffdio_range range;
@@ -1388,10 +1392,21 @@ native_resolve_fault(native_handler_data_t *data, const struct uffd_msg *message
     offset = address - data->start;
     if (data->mode == 1) {
         struct uffdio_zeropage request;
+        int result;
         memset(&request, 0, sizeof(request));
         request.range.start = address;
         request.range.len = data->page_size;
-        return ioctl(data->uffd_fd, UFFDIO_ZEROPAGE, &request);
+        result = ioctl(data->uffd_fd, UFFDIO_ZEROPAGE, &request);
+        if (result < 0) return -1;
+        if (request.zeropage < 0) {
+            errno = (int)-request.zeropage;
+            return -1;
+        }
+        if ((size_t)request.zeropage != data->page_size) {
+            errno = EIO;
+            return -1;
+        }
+        return 0;
     }
 
     if (data->mode == 2 && fill_from_file(data, buffer, (off_t)offset) < 0)
@@ -1401,11 +1416,22 @@ native_resolve_fault(native_handler_data_t *data, const struct uffd_msg *message
 
     {
         struct uffdio_copy request;
+        int result;
         memset(&request, 0, sizeof(request));
         request.dst = address;
         request.src = (uint64_t)(uintptr_t)buffer;
         request.len = data->page_size;
-        return ioctl(data->uffd_fd, UFFDIO_COPY, &request);
+        result = ioctl(data->uffd_fd, UFFDIO_COPY, &request);
+        if (result < 0) return -1;
+        if (request.copy < 0) {
+            errno = (int)-request.copy;
+            return -1;
+        }
+        if ((size_t)request.copy != data->page_size) {
+            errno = EIO;
+            return -1;
+        }
+        return 0;
     }
 }
 
@@ -1500,12 +1526,26 @@ without_gvl_join(void *ptr)
 }
 
 static void
+native_handler_release_regions(native_handler_data_t *data)
+{
+    if (data->registered_region) {
+        data->registered_region->busy--;
+        data->registered_region = NULL;
+    }
+    if (data->source_region) {
+        data->source_region->busy--;
+        data->source_region = NULL;
+    }
+}
+
+static void
 native_handler_stop_and_join(native_handler_data_t *data)
 {
     struct join_args args;
     if (data->pid != getpid()) {
         data->joined = 1;
         data->running = 0;
+        native_handler_release_regions(data);
         return;
     }
     if (data->joined || !data->started) return;
@@ -1518,6 +1558,7 @@ native_handler_stop_and_join(native_handler_data_t *data)
         args.result = pthread_join(args.thread, NULL);
     data->joined = 1;
     data->running = 0;
+    native_handler_release_regions(data);
 }
 
 static VALUE
@@ -1525,12 +1566,14 @@ uffd_start_native_handler(VALUE self, VALUE mode, VALUE source)
 {
     uffd_data_t *owner = get_uffd(self);
     VALUE regions = rb_ivar_get(self, rb_intern("@registered_regions"));
+    VALUE registered_object;
     region_data_t *registered;
     native_handler_data_t *data;
     VALUE object;
     if (NIL_P(regions) || RARRAY_LEN(regions) != 1)
         rb_raise(eError, "native handlers require exactly one registered region");
-    registered = get_region(rb_ary_entry(regions, 0));
+    registered_object = rb_ary_entry(regions, 0);
+    registered = get_region(registered_object);
     object = native_handler_alloc(cNativeHandler);
     TypedData_Get_Struct(object, native_handler_data_t, &native_handler_type, data);
     data->owner = self;
@@ -1551,6 +1594,8 @@ uffd_start_native_handler(VALUE self, VALUE mode, VALUE source)
     } else if (mode == ID2SYM(rb_intern("prefilled"))) {
         region_data_t *region;
         if (NIL_P(source)) rb_raise(rb_eArgError, "source is required for prefilled");
+        if (source == registered_object)
+            rb_raise(rb_eArgError, "source must differ from the registered region");
         region = get_region(source);
         if (region->size < data->length)
             rb_raise(rb_eArgError, "source region is smaller than registered region");
@@ -1563,9 +1608,16 @@ uffd_start_native_handler(VALUE self, VALUE mode, VALUE source)
     if (pipe(data->stop_pipe) < 0) rb_syserr_fail(errno, "pipe");
     fcntl(data->stop_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(data->stop_pipe[1], F_SETFD, FD_CLOEXEC);
+    data->registered_region = registered;
+    registered->busy++;
+    if (data->mode == 3) {
+        data->source_region = get_region(source);
+        data->source_region->busy++;
+    }
     data->running = 1;
     if (pthread_create(&data->thread, NULL, native_handler_main, data) != 0) {
         data->running = 0;
+        native_handler_release_regions(data);
         rb_raise(eError, "failed to start native handler thread");
     }
     data->started = 1;
@@ -1579,9 +1631,11 @@ static VALUE
 native_handler_stop(VALUE self)
 {
     native_handler_data_t *data;
+    int wrong_process;
     TypedData_Get_Struct(self, native_handler_data_t, &native_handler_type, data);
-    if (data->pid != getpid()) rb_raise(eError, "handler cannot be used after fork");
+    wrong_process = data->pid != getpid();
     native_handler_stop_and_join(data);
+    if (wrong_process) rb_raise(eError, "handler cannot be used after fork");
     if (data->error) rb_syserr_fail(data->error, "userfaultfd handler");
     return self;
 }

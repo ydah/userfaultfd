@@ -168,6 +168,29 @@ RSpec.describe "UserfaultFD system integration" do
     end
   end
 
+  it "keeps native handler mappings valid until stop" do
+    region = UserfaultFD::Region.new(size: page_size)
+    source = UserfaultFD::Region.new(size: page_size)
+    uffd = open_uffd(features: [])
+    uffd.register(region, mode: :missing)
+
+    expect { uffd.start_handler(mode: :prefilled, source: region) }
+      .to raise_error(ArgumentError, /must differ/)
+    handler = uffd.start_handler(mode: :prefilled, source: source)
+    expect { region.unmap }.to raise_error(UserfaultFD::Error, /in use/)
+    expect { source.unmap }.to raise_error(UserfaultFD::Error, /in use/)
+    expect { uffd.unregister(region) }.to raise_error(UserfaultFD::Error, /in use/)
+    handler.stop
+    expect(uffd.unregister(region)).to be_nil
+    expect(region.unmap).to be_nil
+    expect(source.unmap).to be_nil
+  ensure
+    handler&.stop
+    uffd&.close
+    region&.unmap
+    source&.unmap
+  end
+
   it "reports and clears write-protect faults when supported" do
     skip "write-protect faults are unavailable" unless UserfaultFD.features.include?(:pagefault_flag_wp)
 
@@ -227,6 +250,7 @@ RSpec.describe "UserfaultFD system integration" do
       event.poison if event.is_a?(UserfaultFD::Fault)
     end
     pid = fork do
+      Process.setrlimit(Process::RLIMIT_CORE, 0)
       signal = Fiddle::Function.new(
         Fiddle::Handle::DEFAULT["signal"],
         [Fiddle::TYPE_INT, Fiddle::TYPE_VOIDP],

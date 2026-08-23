@@ -14,6 +14,7 @@ handler = uffd.start_handler do |event|
 end
 
 pid = fork do
+  Process.setrlimit(Process::RLIMIT_CORE, 0)
   region.read(0, 1)
   exit! 0
 end
