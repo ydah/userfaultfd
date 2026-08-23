@@ -1,0 +1,92 @@
+class UserfaultFD
+  VERSION: String
+
+  class Error < StandardError
+  end
+
+  class UnsupportedError < Error
+  end
+
+  class DeadlockError < Error
+  end
+
+  type feature = :pagefault_flag_wp | :event_fork | :event_remap | :event_remove | :event_unmap | :missing_hugetlbfs | :missing_shmem | :sigbus | :thread_id | :minor_hugetlbfs | :minor_shmem | :exact_address | :wp_hugetlbfs_shmem | :wp_unpopulated | :wp_async | :poison | :move
+  type register_mode = :missing | :wp | :minor
+  type native_mode = :zero_fill | :backing_file | :prefilled
+  type event = Fault | ForkEvent | RemapEvent | RemoveEvent | UnmapEvent
+
+  def self.supported?: () -> bool
+  def self.features: () -> Array[feature]
+  def self.strict: () -> bool
+  def self.strict=: (bool) -> bool
+
+  def initialize: (?features: Array[feature]?) -> void
+  def features: () -> Array[feature]
+  def enabled_features: () -> Array[feature]
+  def backend: () -> (:device | :syscall)
+  def fileno: () -> Integer
+  def to_io: () -> IO
+  def close: () -> nil
+  def closed?: () -> bool
+  def register: (Region, mode: register_mode | Array[register_mode]) -> Integer
+  def unregister: (Region) -> nil
+  def writeprotect: (Region, enabled: bool) -> nil
+  def read_events: (?Integer max) -> Array[event]
+  def start_handler: (mode: native_mode, ?io: IO?, ?source: Region?) -> Handler
+                   | () { (event) -> void } -> Handler
+
+  class Region
+    def initialize: (size: Integer, ?shared: bool, ?huge: bool) -> void
+    def address: () -> Integer
+    def to_ptr: () -> Integer
+    def size: () -> Integer
+    def page_size: () -> Integer
+    def read: (Integer offset, Integer length) -> String
+    def write: (Integer offset, String data) -> Integer
+    def madvise: (:dontneed) -> nil
+    def unmap: () -> nil
+    def unmapped?: () -> bool
+  end
+
+  class Fault
+    attr_reader address: Integer
+    attr_reader flags: Array[:write | :wp | :minor]
+    attr_reader thread_id: Integer?
+    def write?: () -> bool
+    def wp?: () -> bool
+    def minor?: () -> bool
+    def copy: (String, ?wake: bool) -> Integer
+    def zero: (?wake: bool) -> Integer
+    def continue: (?wake: bool) -> Integer
+    def poison: (?wake: bool) -> Integer
+    def wake: () -> nil
+  end
+
+  class ForkEvent
+    attr_reader child_uffd: UserfaultFD
+  end
+
+  class RemapEvent
+    attr_reader from: Integer
+    attr_reader to: Integer
+    attr_reader length: Integer
+  end
+
+  class RemoveEvent
+    attr_reader start: Integer
+    attr_reader end: Integer
+  end
+
+  class UnmapEvent
+    attr_reader start: Integer
+    attr_reader end: Integer
+  end
+
+  class Handler
+    attr_reader error: StandardError?
+    def stop: () -> self
+    def running?: () -> bool
+  end
+end
+
+Userfaultfd: singleton(UserfaultFD)

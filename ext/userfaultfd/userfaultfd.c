@@ -41,13 +41,14 @@ typedef struct {
 typedef struct {
     VALUE owner;
     VALUE source;
+    pid_t pid;
     pthread_t thread;
     int stop_pipe[2];
     int source_fd;
     int started;
-    int running;
+    volatile int running;
     int joined;
-    int error;
+    volatile int error;
     int mode;
     int uffd_fd;
     uintptr_t start;
@@ -59,6 +60,7 @@ typedef struct {
 #define EVENT_READER_MAX_FDS 64
 typedef struct {
     VALUE owner;
+    pid_t pid;
     pthread_t thread;
     int stop_pipe[2];
     int output_pipe[2];
@@ -67,8 +69,8 @@ typedef struct {
     size_t fd_count;
     int started;
     int joined;
-    int running;
-    int error;
+    volatile int running;
+    volatile int error;
 } event_reader_data_t;
 
 static VALUE cUserfaultFD;
@@ -176,6 +178,7 @@ native_handler_alloc(VALUE klass)
     );
     data->owner = Qnil;
     data->source = Qnil;
+    data->pid = getpid();
     data->stop_pipe[0] = -1;
     data->stop_pipe[1] = -1;
     data->source_fd = -1;
@@ -205,6 +208,18 @@ event_reader_free(void *ptr)
     xfree(data);
 }
 
+static void
+event_reader_close_owned(event_reader_data_t *data)
+{
+    size_t i;
+    for (i = 0; i < data->fd_count; i++) {
+        if (data->owned[i] && data->fds[i] >= 0) {
+            close(data->fds[i]);
+            data->fds[i] = -1;
+        }
+    }
+}
+
 static size_t
 event_reader_memsize(const void *ptr)
 {
@@ -226,6 +241,7 @@ event_reader_alloc(VALUE klass)
     );
     size_t i;
     data->owner = Qnil;
+    data->pid = getpid();
     data->stop_pipe[0] = data->stop_pipe[1] = -1;
     data->output_pipe[0] = data->output_pipe[1] = -1;
     for (i = 0; i < EVENT_READER_MAX_FDS; i++) data->fds[i] = -1;
@@ -366,6 +382,12 @@ static const struct feature_name feature_names[] = {
 #ifdef UFFD_FEATURE_EXACT_ADDRESS
     {"exact_address", UFFD_FEATURE_EXACT_ADDRESS},
 #endif
+#ifdef UFFD_FEATURE_WP_HUGETLBFS_SHMEM
+    {"wp_hugetlbfs_shmem", UFFD_FEATURE_WP_HUGETLBFS_SHMEM},
+#endif
+#ifdef UFFD_FEATURE_WP_UNPOPULATED
+    {"wp_unpopulated", UFFD_FEATURE_WP_UNPOPULATED},
+#endif
 #ifdef UFFD_FEATURE_WP_ASYNC
     {"wp_async", UFFD_FEATURE_WP_ASYNC},
 #endif
@@ -427,7 +449,7 @@ uffd_initialize(int argc, VALUE *argv, VALUE self)
     if (!NIL_P(kwargs)) {
         ID keys[] = {id_features};
         rb_get_kwargs(kwargs, keys, 0, 1, values);
-        if (values[0] != Qundef) {
+        if (values[0] != Qundef && !NIL_P(values[0])) {
             features_given = 1;
 #ifdef __linux__
             requested = feature_mask(values[0]);
@@ -1034,6 +1056,20 @@ uffd_read_events(int argc, VALUE *argv, VALUE self)
 #endif
 }
 
+static VALUE
+uffd_parse_message(VALUE klass, VALUE string)
+{
+    (void)klass;
+    StringValue(string);
+#ifdef __linux__
+    if (RSTRING_LEN(string) != (long)sizeof(struct uffd_msg))
+        rb_raise(rb_eArgError, "message has the wrong size");
+    return parse_event(Qnil, (const struct uffd_msg *)RSTRING_PTR(string));
+#else
+    raise_unsupported("userfaultfd messages are only available on Linux");
+#endif
+}
+
 static uffd_data_t *
 fault_owner(VALUE self)
 {
@@ -1343,6 +1379,11 @@ native_handler_stop_and_join(native_handler_data_t *data)
 {
     struct join_args args;
     char byte = 0;
+    if (data->pid != getpid()) {
+        data->joined = 1;
+        data->running = 0;
+        return;
+    }
     if (data->joined || !data->started) return;
     if (data->stop_pipe[1] >= 0) (void)write(data->stop_pipe[1], &byte, 1);
     args.thread = data->thread;
@@ -1412,6 +1453,7 @@ native_handler_stop(VALUE self)
 {
     native_handler_data_t *data;
     TypedData_Get_Struct(self, native_handler_data_t, &native_handler_type, data);
+    if (data->pid != getpid()) rb_raise(eError, "handler cannot be used after fork");
     native_handler_stop_and_join(data);
     if (data->error) rb_syserr_fail(data->error, "userfaultfd handler");
     return self;
@@ -1546,6 +1588,11 @@ event_reader_stop_and_join(event_reader_data_t *data)
 {
     struct join_args args;
     char byte = 0;
+    if (data->pid != getpid()) {
+        data->joined = 1;
+        data->running = 0;
+        return;
+    }
     if (data->joined || !data->started) return;
     if (data->stop_pipe[1] >= 0) (void)write(data->stop_pipe[1], &byte, 1);
     args.thread = data->thread;
@@ -1677,7 +1724,9 @@ event_reader_stop(VALUE self)
 {
     event_reader_data_t *data;
     TypedData_Get_Struct(self, event_reader_data_t, &event_reader_type, data);
+    if (data->pid != getpid()) rb_raise(eError, "event reader cannot be used after fork");
     event_reader_stop_and_join(data);
+    event_reader_close_owned(data);
     if (data->error) rb_syserr_fail(data->error, "userfaultfd event reader");
     return self;
 }
@@ -1710,6 +1759,8 @@ Init_userfaultfd(void)
     rb_define_method(cUserfaultFD, "initialize", uffd_initialize, -1);
     rb_define_singleton_method(cUserfaultFD, "supported?", uffd_supported, 0);
     rb_define_singleton_method(cUserfaultFD, "features", uffd_features, 0);
+    rb_define_private_method(rb_singleton_class(cUserfaultFD), "parse_message",
+                             uffd_parse_message, 1);
     rb_define_method(cUserfaultFD, "features", uffd_instance_features, 0);
     rb_define_method(cUserfaultFD, "enabled_features", uffd_enabled_features, 0);
     rb_define_method(cUserfaultFD, "backend", uffd_backend, 0);

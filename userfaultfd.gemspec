@@ -15,7 +15,6 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.2.0"
   spec.metadata["allowed_push_host"] = "https://rubygems.org"
   spec.metadata["homepage_uri"] = spec.homepage
-  spec.metadata["source_code_uri"] = spec.homepage
   spec.metadata["rubygems_mfa_required"] = "true"
 
   # Uncomment the line below to require MFA for gem pushes.
@@ -26,7 +25,7 @@ Gem::Specification.new do |spec|
 
   # Specify which files should be added to the gem when it is released.
   # The `git ls-files -z` loads the files in the RubyGem that have been added into git.
-  spec.files = Dir["README.md", "LICENSE.txt", "ext/**/*", "lib/**/*", "sig/**/*"]
+  spec.files = Dir["README.md", "LICENSE.txt", "docs/**/*", "examples/**/*", "ext/**/*", "lib/**/*", "sig/**/*"]
   spec.extensions = ["ext/userfaultfd/extconf.rb"]
   spec.require_paths = ["lib"]
 

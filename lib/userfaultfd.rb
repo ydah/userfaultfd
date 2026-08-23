@@ -2,6 +2,23 @@
 
 require_relative "userfaultfd/version"
 
+# Linux userfaultfd descriptor and capability API.
+#
+# @!method self.supported?
+#   @return [Boolean] whether a permitted userfaultfd can be initialized
+# @!method self.features
+#   @return [Array<Symbol>] features available from the running kernel
+# @!method initialize(features: nil)
+#   @param features [Array<Symbol>, nil] features to require; by default fork
+#     events are attempted and omitted when the kernel denies permission
+# @!method register(region, mode:)
+#   @param region [UserfaultFD::Region]
+#   @param mode [Symbol, Array<Symbol>] `:missing`, `:wp`, or `:minor`
+#   @return [Integer] ioctl bitmask supported for the range
+# @!method unregister(region)
+#   @return [nil]
+# @!method enabled_features
+#   @return [Array<Symbol>] features enabled for this descriptor
 class UserfaultFD
   class Error < StandardError; end
   class UnsupportedError < Error; end
@@ -27,6 +44,7 @@ class UserfaultFD
   end
 end
 
+# A page-fault event. Resolution methods wake the faulting thread by default.
 class UserfaultFD::Fault
   def write? = flags.include?(:write)
   def wp? = flags.include?(:wp)

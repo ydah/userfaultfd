@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 class UserfaultFD
+  # Owns either a Ruby callback thread or a GVL-free native handler thread.
   class Handler
     attr_reader :error
 
@@ -46,17 +47,26 @@ class UserfaultFD
       @stop_reader, @stop_writer = IO.pipe
       @event_reader = @uffd.__send__(:start_event_reader)
       @event_io = IO.for_fd(@event_reader.fileno, autoclose: false)
+      @children = []
       @thread = Thread.new do
         loop do
           ready = IO.select([@event_io, @stop_reader])&.first
           break if ready&.include?(@stop_reader)
 
-          @event_reader.read_events.each(&block)
+          @event_reader.read_events.each do |event|
+            @children << event.child_uffd if event.is_a?(ForkEvent)
+            block.call(event)
+          end
         end
       rescue StandardError => e
         @error = e
       ensure
-        @event_reader.stop
+        begin
+          @event_reader.stop
+        rescue StandardError => e
+          @error ||= e
+        end
+        @children.each(&:close)
         @stop_reader.close
         @stop_writer.close
       end

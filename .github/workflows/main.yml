@@ -11,12 +11,15 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  unit:
     runs-on: ubuntu-latest
     name: Ruby ${{ matrix.ruby }}
     strategy:
       matrix:
         ruby:
+          - '3.2'
+          - '3.3'
+          - '3.4'
           - '4.0'
 
     steps:
@@ -28,5 +31,22 @@ jobs:
         with:
           ruby-version: ${{ matrix.ruby }}
           bundler-cache: true
-      - name: Run the default task
-        run: bundle exec rake
+      - name: Compile and run unit tests
+        run: bundle exec rake compile test:unit
+      - name: Validate RBS
+        run: bundle exec rbs -I sig validate
+      - name: Build gem
+        run: bundle exec gem build userfaultfd.gemspec
+
+  system:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - name: Run host-kernel tests
+        run: bundle exec rake compile test:system
