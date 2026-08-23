@@ -244,7 +244,11 @@ RSpec.describe "UserfaultFD system integration" do
     skip "poison and fork events are unavailable" unless (required - UserfaultFD.features).empty?
 
     region = UserfaultFD::Region.new(size: page_size)
-    uffd = open_uffd(features: required)
+    begin
+      uffd = open_uffd(features: required)
+    rescue Errno::EPERM
+      skip "EVENT_FORK requires CAP_SYS_PTRACE"
+    end
     uffd.register(region, mode: :missing)
     handler = uffd.start_handler do |event|
       event.poison if event.is_a?(UserfaultFD::Fault)
