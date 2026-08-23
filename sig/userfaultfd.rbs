@@ -59,6 +59,7 @@ class UserfaultFD
     def zero: (?wake: bool) -> Integer
     def continue: (?wake: bool) -> Integer
     def poison: (?wake: bool) -> Integer
+    def move: (Region source, ?offset: Integer, ?wake: bool) -> Integer
     def wake: () -> nil
   end
 

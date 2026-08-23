@@ -130,11 +130,34 @@ RSpec.describe "UserfaultFD system integration" do
     region&.unmap
   end
 
-  it "does not leak descriptors over repeated opens" do
-    before = Dir["/proc/self/fd/*"].size
+  it "moves a populated page into a fault when supported" do
+    skip "UFFDIO_MOVE is unavailable" unless UserfaultFD.features.include?(:move)
+
+    source = UserfaultFD::Region.new(size: page_size, shared: false)
+    region = UserfaultFD::Region.new(size: page_size, shared: false)
+    source.write(0, "m" * page_size)
+    uffd = UserfaultFD.new(features: [:move])
+    uffd.register(region, mode: :missing)
+    handler = uffd.start_handler do |event|
+      event.move(source) if event.is_a?(UserfaultFD::Fault)
+    end
+
+    expect(region.read(0, page_size)).to eq("m" * page_size)
+  ensure
+    handler&.stop
+    uffd&.close
+    region&.unmap
+    source&.unmap
+  end
+
+  it "does not leak descriptors or mappings over repeated operations" do
+    fd_before = Dir["/proc/self/fd/*"].size
+    maps_before = File.readlines("/proc/self/maps").size
     1_000.times { UserfaultFD.new(features: []).close }
+    1_000.times { UserfaultFD::Region.new(size: page_size).unmap }
     GC.start
-    expect(Dir["/proc/self/fd/*"].size).to be <= before + 1
+    expect(Dir["/proc/self/fd/*"].size).to be <= fd_before + 1
+    expect(File.readlines("/proc/self/maps").size).to be <= maps_before + 1
   end
 
   it "documents raw-pointer deadlock with an isolated timeout" do

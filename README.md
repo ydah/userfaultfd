@@ -99,7 +99,7 @@ region.unmap
 
 ## Other operations
 
-- `Fault#zero`, `#copy`, `#wake`, `#continue`, and `#poison`
+- `Fault#zero`, `#copy`, `#wake`, `#continue`, `#poison`, and `#move`
 - `UserfaultFD#writeprotect` with `mode: [:missing, :wp]`
 - `Region#madvise(:dontneed)` to discard shared pages and fault again
 - `mode: :backing_file, io: file` for native lazy file loading

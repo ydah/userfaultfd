@@ -92,6 +92,7 @@ static ID id_features;
 static ID id_mode;
 static ID id_enabled;
 static ID id_wake;
+static ID id_offset;
 
 void userfaultfd_define_constants(VALUE klass);
 
@@ -1241,6 +1242,45 @@ fault_poison(int argc, VALUE *argv, VALUE self)
 #endif
 }
 
+static VALUE
+fault_move(int argc, VALUE *argv, VALUE self)
+{
+    VALUE source_object, kwargs;
+    VALUE values[2] = {Qundef, Qundef};
+    ID keys[] = {id_offset, id_wake};
+    region_data_t *source;
+    size_t offset = 0, page_size = fault_page_size(self);
+    int wake = 1;
+    uffd_data_t *owner;
+    rb_scan_args(argc, argv, "1:", &source_object, &kwargs);
+    source = get_region(source_object);
+    if (!NIL_P(kwargs)) {
+        rb_get_kwargs(kwargs, keys, 0, 2, values);
+        if (values[0] != Qundef) offset = NUM2SIZET(values[0]);
+        if (values[1] != Qundef) wake = values[1] != Qfalse;
+    }
+    if (offset % page_size != 0 || offset > source->size ||
+        page_size > source->size - offset)
+        rb_raise(rb_eArgError, "source offset must select a complete aligned page");
+    owner = fault_owner(self);
+#if defined(__linux__) && defined(UFFDIO_MOVE)
+    {
+        struct uffdio_move request;
+        memset(&request, 0, sizeof(request));
+        request.dst = (uint64_t)fault_address(self);
+        request.src = (uint64_t)(uintptr_t)((char *)source->address + offset);
+        request.len = page_size;
+        request.mode = wake ? 0 : UFFDIO_MOVE_MODE_DONTWAKE;
+        run_ioctl_without_gvl(owner->fd, UFFDIO_MOVE, &request, "UFFDIO_MOVE");
+        if (request.move < 0) rb_syserr_fail((int)-request.move, "UFFDIO_MOVE");
+        return LL2NUM(request.move);
+    }
+#else
+    (void)owner; (void)wake;
+    raise_unsupported("UFFDIO_MOVE is unavailable on this platform");
+#endif
+}
+
 #ifdef __linux__
 static int
 fill_from_file(native_handler_data_t *data, void *buffer, off_t offset)
@@ -1366,6 +1406,17 @@ struct join_args {
     int result;
 };
 
+static void
+signal_stop_pipe(int fd)
+{
+    char byte = 0;
+    ssize_t result;
+    if (fd < 0) return;
+    do {
+        result = write(fd, &byte, 1);
+    } while (result < 0 && errno == EINTR);
+}
+
 static void *
 without_gvl_join(void *ptr)
 {
@@ -1378,14 +1429,13 @@ static void
 native_handler_stop_and_join(native_handler_data_t *data)
 {
     struct join_args args;
-    char byte = 0;
     if (data->pid != getpid()) {
         data->joined = 1;
         data->running = 0;
         return;
     }
     if (data->joined || !data->started) return;
-    if (data->stop_pipe[1] >= 0) (void)write(data->stop_pipe[1], &byte, 1);
+    signal_stop_pipe(data->stop_pipe[1]);
     args.thread = data->thread;
     args.result = 0;
     if (ruby_native_thread_p())
@@ -1587,14 +1637,13 @@ static void
 event_reader_stop_and_join(event_reader_data_t *data)
 {
     struct join_args args;
-    char byte = 0;
     if (data->pid != getpid()) {
         data->joined = 1;
         data->running = 0;
         return;
     }
     if (data->joined || !data->started) return;
-    if (data->stop_pipe[1] >= 0) (void)write(data->stop_pipe[1], &byte, 1);
+    signal_stop_pipe(data->stop_pipe[1]);
     args.thread = data->thread;
     args.result = 0;
     if (ruby_native_thread_p())
@@ -1754,6 +1803,7 @@ Init_userfaultfd(void)
     id_mode = rb_intern("mode");
     id_enabled = rb_intern("enabled");
     id_wake = rb_intern("wake");
+    id_offset = rb_intern("offset");
 
     rb_define_alloc_func(cUserfaultFD, uffd_alloc);
     rb_define_method(cUserfaultFD, "initialize", uffd_initialize, -1);
@@ -1796,6 +1846,7 @@ Init_userfaultfd(void)
     rb_define_method(cFault, "zero", fault_zero, -1);
     rb_define_method(cFault, "continue", fault_continue, -1);
     rb_define_method(cFault, "poison", fault_poison, -1);
+    rb_define_method(cFault, "move", fault_move, -1);
     rb_define_method(cFault, "wake", fault_wake, 0);
 
     cForkEvent = rb_define_class_under(cUserfaultFD, "ForkEvent", rb_cObject);

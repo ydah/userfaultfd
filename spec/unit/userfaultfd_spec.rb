@@ -10,4 +10,10 @@ RSpec.describe UserfaultFD do
 
     expect { described_class.new }.to raise_error(UserfaultFD::UnsupportedError)
   end
+
+  it "rejects unknown feature names before opening a descriptor" do
+    skip "feature masks are Linux-only" unless RUBY_PLATFORM.include?("linux")
+
+    expect { described_class.new(features: [:unknown]) }.to raise_error(ArgumentError, /unknown feature/)
+  end
 end
