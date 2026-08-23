@@ -17,6 +17,9 @@
 # include <sys/ioctl.h>
 # include <sys/syscall.h>
 # include "compat.h"
+# if !defined(SYS_userfaultfd) && defined(__NR_userfaultfd)
+#  define SYS_userfaultfd __NR_userfaultfd
+# endif
 #endif
 
 typedef struct {
@@ -25,8 +28,6 @@ typedef struct {
     uint64_t features;
     uint64_t enabled_features;
     uint64_t ioctls;
-    uintptr_t registered_start;
-    size_t registered_length;
     int backend;
 } uffd_data_t;
 
@@ -89,6 +90,7 @@ static ID id_size;
 static ID id_shared;
 static ID id_huge;
 static ID id_features;
+static ID id_user_mode_only;
 static ID id_mode;
 static ID id_enabled;
 static ID id_wake;
@@ -298,12 +300,13 @@ raise_unsupported(const char *message)
 
 #ifdef __linux__
 static int
-open_uffd(int *backend)
+open_uffd(int *backend, int user_mode_only)
 {
+    int flags = O_CLOEXEC | O_NONBLOCK;
+    if (user_mode_only) flags |= UFFD_USER_MODE_ONLY;
     int dev = open("/dev/userfaultfd", O_RDWR | O_CLOEXEC);
     if (dev >= 0) {
-        int fd = ioctl(dev, USERFAULTFD_IOC_NEW,
-                       O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        int fd = ioctl(dev, USERFAULTFD_IOC_NEW, flags);
         int saved_errno = errno;
         close(dev);
         if (fd >= 0) {
@@ -315,8 +318,7 @@ open_uffd(int *backend)
 
 # ifdef SYS_userfaultfd
     {
-        int fd = (int)syscall(SYS_userfaultfd,
-                              O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+        int fd = (int)syscall(SYS_userfaultfd, flags);
         if (fd >= 0) {
             *backend = 2;
             return fd;
@@ -441,15 +443,16 @@ static VALUE
 uffd_initialize(int argc, VALUE *argv, VALUE self)
 {
     VALUE kwargs = Qnil;
-    VALUE values[1] = {Qundef};
+    VALUE values[2] = {Qundef, Qundef};
     uint64_t requested = 0;
     int features_given = 0;
+    int user_mode_only = 1;
     uffd_data_t *data;
 
     rb_scan_args(argc, argv, "0:", &kwargs);
     if (!NIL_P(kwargs)) {
-        ID keys[] = {id_features};
-        rb_get_kwargs(kwargs, keys, 0, 1, values);
+        ID keys[] = {id_features, id_user_mode_only};
+        rb_get_kwargs(kwargs, keys, 0, 2, values);
         if (values[0] != Qundef && !NIL_P(values[0])) {
             features_given = 1;
 #ifdef __linux__
@@ -458,13 +461,18 @@ uffd_initialize(int argc, VALUE *argv, VALUE self)
             (void)values;
 #endif
         }
+        if (values[1] != Qundef) {
+            if (values[1] != Qtrue && values[1] != Qfalse)
+                rb_raise(rb_eArgError, "user_mode_only must be true or false");
+            user_mode_only = values[1] == Qtrue;
+        }
     }
     TypedData_Get_Struct(self, uffd_data_t, &uffd_type, data);
 
 #ifdef __linux__
     {
         int probe_backend = 0;
-        int probe_fd = open_uffd(&probe_backend);
+        int probe_fd = open_uffd(&probe_backend, user_mode_only);
         uint64_t available = 0, ignored_ioctls = 0;
         int saved_errno;
         if (probe_fd < 0) {
@@ -489,7 +497,7 @@ uffd_initialize(int argc, VALUE *argv, VALUE self)
             raise_unsupported("requested userfaultfd features are unavailable");
 
 open_production_fd:
-        data->fd = open_uffd(&data->backend);
+        data->fd = open_uffd(&data->backend, user_mode_only);
         if (data->fd < 0) rb_syserr_fail(errno, "userfaultfd");
         if (query_api(data->fd, requested, &data->features, &data->ioctls) < 0) {
             saved_errno = errno;
@@ -508,19 +516,34 @@ open_production_fd:
 #else
     (void)requested;
     (void)features_given;
+    (void)user_mode_only;
     raise_unsupported("userfaultfd is only available on Linux");
 #endif
     return self;
 }
 
-static VALUE
-uffd_supported(VALUE klass)
+static int
+user_mode_only_option(int argc, VALUE *argv)
 {
+    VALUE kwargs = Qnil;
+    VALUE value = Qundef;
+    ID key = id_user_mode_only;
+    rb_scan_args(argc, argv, "0:", &kwargs);
+    if (!NIL_P(kwargs)) rb_get_kwargs(kwargs, &key, 0, 1, &value);
+    if (value != Qundef && value != Qtrue && value != Qfalse)
+        rb_raise(rb_eArgError, "user_mode_only must be true or false");
+    return value == Qundef || value == Qtrue;
+}
+
+static VALUE
+uffd_supported(int argc, VALUE *argv, VALUE klass)
+{
+    int user_mode_only = user_mode_only_option(argc, argv);
     (void)klass;
 #ifdef __linux__
     {
         int backend = 0;
-        int fd = open_uffd(&backend);
+        int fd = open_uffd(&backend, user_mode_only);
         uint64_t features, ioctls;
         if (fd < 0) return Qfalse;
         if (query_api(fd, 0, &features, &ioctls) < 0) {
@@ -531,19 +554,21 @@ uffd_supported(VALUE klass)
         return Qtrue;
     }
 #else
+    (void)user_mode_only;
     return Qfalse;
 #endif
     return Qnil;
 }
 
 static VALUE
-uffd_features(VALUE klass)
+uffd_features(int argc, VALUE *argv, VALUE klass)
 {
+    int user_mode_only = user_mode_only_option(argc, argv);
     (void)klass;
 #ifdef __linux__
     {
         int backend = 0;
-        int fd = open_uffd(&backend);
+        int fd = open_uffd(&backend, user_mode_only);
         uint64_t features, ioctls;
         if (fd < 0) return rb_ary_new();
         if (query_api(fd, 0, &features, &ioctls) < 0) {
@@ -554,6 +579,7 @@ uffd_features(VALUE klass)
         return features_to_array(features);
     }
 #else
+    (void)user_mode_only;
     return rb_ary_new();
 #endif
 }
@@ -603,6 +629,7 @@ uffd_close(VALUE self)
     if (data->fd >= 0) {
         close(data->fd);
         data->fd = -1;
+        rb_ivar_set(self, rb_intern("@registered_regions"), Qnil);
     }
     return Qnil;
 }
@@ -757,13 +784,17 @@ static VALUE
 region_madvise(VALUE self, VALUE advice)
 {
     region_data_t *data = get_region(self);
-    if (advice != ID2SYM(rb_intern("dontneed")))
-        rb_raise(rb_eArgError, "unknown advice");
     {
-        int native_advice = MADV_DONTNEED;
+        int native_advice;
+        if (advice == ID2SYM(rb_intern("dontneed"))) {
+            native_advice = MADV_DONTNEED;
 #ifdef MADV_REMOVE
-        if (data->shared) native_advice = MADV_REMOVE;
+        } else if (advice == ID2SYM(rb_intern("remove"))) {
+            native_advice = MADV_REMOVE;
 #endif
+        } else {
+            rb_raise(rb_eArgError, "unknown advice");
+        }
         if (madvise(data->address, data->size, native_advice) < 0)
             rb_syserr_fail(errno, "madvise");
     }
@@ -788,7 +819,15 @@ register_mode(VALUE value)
 #endif
         else rb_raise(rb_eArgError, "unknown registration mode");
     }
+    if (result == 0) rb_raise(rb_eArgError, "at least one registration mode is required");
     return result;
+}
+
+static void
+require_enabled_feature(uffd_data_t *data, uint64_t mask, const char *name)
+{
+    if ((data->enabled_features & mask) == 0)
+        raise_unsupported(name);
 }
 #endif
 
@@ -806,15 +845,33 @@ uffd_register(int argc, VALUE *argv, VALUE self)
 #ifdef __linux__
     {
         struct uffdio_register request;
+        uint64_t mode = register_mode(values[0]);
+#ifdef UFFDIO_REGISTER_MODE_WP
+        if (mode & UFFDIO_REGISTER_MODE_WP)
+            require_enabled_feature(data, UFFD_FEATURE_PAGEFAULT_FLAG_WP,
+                                    "write-protect faults were not enabled");
+#endif
+#ifdef UFFDIO_REGISTER_MODE_MINOR
+        if (mode & UFFDIO_REGISTER_MODE_MINOR)
+            require_enabled_feature(data,
+                                    UFFD_FEATURE_MINOR_HUGETLBFS |
+                                    UFFD_FEATURE_MINOR_SHMEM,
+                                    "minor faults were not enabled");
+#endif
         memset(&request, 0, sizeof(request));
         request.range.start = (uint64_t)(uintptr_t)region->address;
         request.range.len = region->size;
-        request.mode = register_mode(values[0]);
+        request.mode = mode;
         if (ioctl(data->fd, UFFDIO_REGISTER, &request) < 0)
             rb_syserr_fail(errno, "UFFDIO_REGISTER");
-        data->registered_start = (uintptr_t)region->address;
-        data->registered_length = region->size;
-        rb_ivar_set(self, rb_intern("@registered_region"), region_object);
+        {
+            VALUE regions = rb_ivar_get(self, rb_intern("@registered_regions"));
+            if (NIL_P(regions)) {
+                regions = rb_ary_new();
+                rb_ivar_set(self, rb_intern("@registered_regions"), regions);
+            }
+            rb_ary_push(regions, region_object);
+        }
         return ULL2NUM(request.ioctls);
     }
 #else
@@ -835,10 +892,9 @@ uffd_unregister(VALUE self, VALUE region_object)
         range.len = region->size;
         if (ioctl(data->fd, UFFDIO_UNREGISTER, &range) < 0)
             rb_syserr_fail(errno, "UFFDIO_UNREGISTER");
-        if (data->registered_start == (uintptr_t)region->address) {
-            data->registered_start = 0;
-            data->registered_length = 0;
-            rb_ivar_set(self, rb_intern("@registered_region"), Qnil);
+        {
+            VALUE regions = rb_ivar_get(self, rb_intern("@registered_regions"));
+            if (!NIL_P(regions)) rb_ary_delete(regions, region_object);
         }
     }
 #else
@@ -862,6 +918,8 @@ uffd_writeprotect(int argc, VALUE *argv, VALUE self)
 #if defined(__linux__) && defined(UFFDIO_WRITEPROTECT)
     {
         struct uffdio_writeprotect request;
+        require_enabled_feature(data, UFFD_FEATURE_PAGEFAULT_FLAG_WP,
+                                "write-protect faults were not enabled");
         memset(&request, 0, sizeof(request));
         request.range.start = (uint64_t)(uintptr_t)region->address;
         request.range.len = region->size;
@@ -948,8 +1006,16 @@ new_fault(VALUE owner, const struct uffd_msg *message)
     rb_ivar_set(event, rb_intern("@flags"), flags);
     rb_ivar_set(event, rb_intern("@page_size"), SIZET2NUM(page_size));
 #ifdef UFFD_FEATURE_THREAD_ID
-    rb_ivar_set(event, rb_intern("@thread_id"),
-                UINT2NUM(message->arg.pagefault.feat.ptid));
+    if (NIL_P(owner)) {
+        rb_ivar_set(event, rb_intern("@thread_id"),
+                    UINT2NUM(message->arg.pagefault.feat.ptid));
+    } else {
+        uffd_data_t *data;
+        TypedData_Get_Struct(owner, uffd_data_t, &uffd_type, data);
+        rb_ivar_set(event, rb_intern("@thread_id"),
+                    data->enabled_features & UFFD_FEATURE_THREAD_ID ?
+                    UINT2NUM(message->arg.pagefault.feat.ptid) : Qnil);
+    }
 #else
     rb_ivar_set(event, rb_intern("@thread_id"), Qnil);
 #endif
@@ -1201,6 +1267,10 @@ fault_continue(int argc, VALUE *argv, VALUE self)
 #if defined(__linux__) && defined(UFFDIO_CONTINUE)
     {
         struct uffdio_continue request;
+        require_enabled_feature(owner,
+                                UFFD_FEATURE_MINOR_HUGETLBFS |
+                                UFFD_FEATURE_MINOR_SHMEM,
+                                "minor faults were not enabled");
         memset(&request, 0, sizeof(request));
         request.range.start = (uint64_t)fault_address(self);
         request.range.len = fault_page_size(self);
@@ -1227,6 +1297,8 @@ fault_poison(int argc, VALUE *argv, VALUE self)
 #if defined(__linux__) && defined(UFFDIO_POISON)
     {
         struct uffdio_poison request;
+        require_enabled_feature(owner, UFFD_FEATURE_POISON,
+                                "page poisoning was not enabled");
         memset(&request, 0, sizeof(request));
         request.range.start = (uint64_t)fault_address(self);
         request.range.len = fault_page_size(self);
@@ -1266,6 +1338,8 @@ fault_move(int argc, VALUE *argv, VALUE self)
 #if defined(__linux__) && defined(UFFDIO_MOVE)
     {
         struct uffdio_move request;
+        require_enabled_feature(owner, UFFD_FEATURE_MOVE,
+                                "page move was not enabled");
         memset(&request, 0, sizeof(request));
         request.dst = (uint64_t)fault_address(self);
         request.src = (uint64_t)(uintptr_t)((char *)source->address + offset);
@@ -1450,17 +1524,20 @@ static VALUE
 uffd_start_native_handler(VALUE self, VALUE mode, VALUE source)
 {
     uffd_data_t *owner = get_uffd(self);
+    VALUE regions = rb_ivar_get(self, rb_intern("@registered_regions"));
+    region_data_t *registered;
     native_handler_data_t *data;
     VALUE object;
-    if (!owner->registered_start || !owner->registered_length)
-        rb_raise(eError, "register a region before starting a native handler");
+    if (NIL_P(regions) || RARRAY_LEN(regions) != 1)
+        rb_raise(eError, "native handlers require exactly one registered region");
+    registered = get_region(rb_ary_entry(regions, 0));
     object = native_handler_alloc(cNativeHandler);
     TypedData_Get_Struct(object, native_handler_data_t, &native_handler_type, data);
     data->owner = self;
     data->source = source;
     data->uffd_fd = owner->fd;
-    data->start = owner->registered_start;
-    data->length = owner->registered_length;
+    data->start = (uintptr_t)registered->address;
+    data->length = registered->size;
     data->page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (mode == ID2SYM(rb_intern("zero_fill"))) {
         data->mode = 1;
@@ -1800,6 +1877,7 @@ Init_userfaultfd(void)
     id_shared = rb_intern("shared");
     id_huge = rb_intern("huge");
     id_features = rb_intern("features");
+    id_user_mode_only = rb_intern("user_mode_only");
     id_mode = rb_intern("mode");
     id_enabled = rb_intern("enabled");
     id_wake = rb_intern("wake");
@@ -1807,8 +1885,8 @@ Init_userfaultfd(void)
 
     rb_define_alloc_func(cUserfaultFD, uffd_alloc);
     rb_define_method(cUserfaultFD, "initialize", uffd_initialize, -1);
-    rb_define_singleton_method(cUserfaultFD, "supported?", uffd_supported, 0);
-    rb_define_singleton_method(cUserfaultFD, "features", uffd_features, 0);
+    rb_define_singleton_method(cUserfaultFD, "supported?", uffd_supported, -1);
+    rb_define_singleton_method(cUserfaultFD, "features", uffd_features, -1);
     rb_define_private_method(rb_singleton_class(cUserfaultFD), "parse_message",
                              uffd_parse_message, 1);
     rb_define_method(cUserfaultFD, "features", uffd_instance_features, 0);

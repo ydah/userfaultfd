@@ -4,13 +4,16 @@ require_relative "userfaultfd/version"
 
 # Linux userfaultfd descriptor and capability API.
 #
-# @!method self.supported?
+# @!method self.supported?(user_mode_only: true)
+#   @param user_mode_only [Boolean] restrict faults to userspace; set false only
+#     on Linux before 5.11 when the caller has the required privilege
 #   @return [Boolean] whether a permitted userfaultfd can be initialized
-# @!method self.features
+# @!method self.features(user_mode_only: true)
 #   @return [Array<Symbol>] features available from the running kernel
-# @!method initialize(features: nil)
+# @!method initialize(features: nil, user_mode_only: true)
 #   @param features [Array<Symbol>, nil] features to require; by default fork
 #     events are attempted and omitted when the kernel denies permission
+#   @param user_mode_only [Boolean] restrict faults to userspace
 # @!method register(region, mode:)
 #   @param region [UserfaultFD::Region]
 #   @param mode [Symbol, Array<Symbol>] `:missing`, `:wp`, or `:minor`

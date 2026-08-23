@@ -15,12 +15,12 @@ class UserfaultFD
   type native_mode = :zero_fill | :backing_file | :prefilled
   type event = Fault | ForkEvent | RemapEvent | RemoveEvent | UnmapEvent
 
-  def self.supported?: () -> bool
-  def self.features: () -> Array[feature]
+  def self.supported?: (?user_mode_only: bool) -> bool
+  def self.features: (?user_mode_only: bool) -> Array[feature]
   def self.strict: () -> bool
   def self.strict=: (bool) -> bool
 
-  def initialize: (?features: Array[feature]?) -> void
+  def initialize: (?features: Array[feature]?, ?user_mode_only: bool) -> void
   def features: () -> Array[feature]
   def enabled_features: () -> Array[feature]
   def backend: () -> (:device | :syscall)
@@ -43,7 +43,7 @@ class UserfaultFD
     def page_size: () -> Integer
     def read: (Integer offset, Integer length) -> String
     def write: (Integer offset, String data) -> Integer
-    def madvise: (:dontneed) -> nil
+    def madvise: (:dontneed | :remove) -> nil
     def unmap: () -> nil
     def unmapped?: () -> bool
   end

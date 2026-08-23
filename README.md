@@ -18,10 +18,10 @@ See [docs/gvl-and-page-faults.md](docs/gvl-and-page-faults.md) for the full fail
 
 - Linux 4.11 or newer with `CONFIG_USERFAULTFD`
 - Ruby 3.2 or newer
-- A C compiler and Linux UAPI headers when installing the gem
+- A C compiler; the Linux 4.11 baseline UAPI is bundled for build hosts without `linux/userfaultfd.h`
 - Permission through `/dev/userfaultfd`, or the `userfaultfd(2)` syscall with `UFFD_USER_MODE_ONLY`
 
-The gem tries `/dev/userfaultfd` first and falls back to the syscall. Requiring the gem succeeds on unsupported systems; `UserfaultFD.supported?` returns `false`, and opening a descriptor raises `UserfaultFD::UnsupportedError` or the relevant `Errno::*` permission error.
+The gem tries `/dev/userfaultfd` first and falls back to the syscall. Requiring the gem succeeds on unsupported systems; `UserfaultFD.supported?` returns `false`, and opening a descriptor raises `UserfaultFD::UnsupportedError` or the relevant `Errno::*` permission error. Linux before 5.11 does not understand `UFFD_USER_MODE_ONLY`; an appropriately permitted caller can explicitly use `user_mode_only: false` with `.supported?`, `.features`, and `.new`. This opts into kernel-originated faults and is never automatic.
 
 ## Installation
 
@@ -56,14 +56,15 @@ region.unmap
 `Region#read` releases the GVL, allowing the handler's Ruby block to run:
 
 ```ruby
-region = UserfaultFD::Region.new(size: 4096)
+page_size = UserfaultFD::Region.allocate.page_size
+region = UserfaultFD::Region.new(size: page_size)
 uffd = UserfaultFD.new(features: [])
 uffd.register(region, mode: :missing)
 handler = uffd.start_handler do |event|
   event.copy("x" * region.page_size) if event.is_a?(UserfaultFD::Fault)
 end
 
-region.read(0, region.page_size) #=> "x" * 4096
+region.read(0, region.page_size) #=> "x" * page_size
 
 handler.stop
 uffd.close
@@ -75,7 +76,8 @@ region.unmap
 When permitted, `UserfaultFD.new` enables `EVENT_FORK` by default. A native event reader consumes the fork event without waiting for the GVL, then delivers `ForkEvent` and child faults to the Ruby handler.
 
 ```ruby
-region = UserfaultFD::Region.new(size: 4096)
+page_size = UserfaultFD::Region.allocate.page_size
+region = UserfaultFD::Region.new(size: page_size)
 uffd = UserfaultFD.new
 raise "EVENT_FORK needs CAP_SYS_PTRACE" unless uffd.enabled_features.include?(:event_fork)
 
@@ -101,7 +103,7 @@ region.unmap
 
 - `Fault#zero`, `#copy`, `#wake`, `#continue`, `#poison`, and `#move`
 - `UserfaultFD#writeprotect` with `mode: [:missing, :wp]`
-- `Region#madvise(:dontneed)` to discard shared pages and fault again
+- `Region#madvise(:dontneed)` to drop page-table entries and `:remove` to discard shared pages
 - `mode: :backing_file, io: file` for native lazy file loading
 - `mode: :prefilled, source: region` for native copies from another region
 - `ForkEvent`, `RemapEvent`, `RemoveEvent`, and `UnmapEvent`
@@ -115,6 +117,7 @@ Optional ioctls raise `UnsupportedError` when they are absent from the build hea
 |---|---|
 | macOS, BSD, Windows | `require` works; `supported?` is `false` |
 | Linux before 4.11 or without `CONFIG_USERFAULTFD` | Unsupported |
+| Linux 4.11–5.10 | An appropriately permitted caller must explicitly pass `user_mode_only: false` |
 | Docker with the default seccomp profile | The syscall is commonly blocked; allow `userfaultfd` or use an accessible `/dev/userfaultfd` |
 | Docker Desktop / WSL2 | Depends on the VM kernel, config, device, and seccomp policy rather than the guest userspace alone |
 | Linux with `vm.unprivileged_userfaultfd=0` | User-mode-only faults still work on kernels that honor `UFFD_USER_MODE_ONLY`; fork events require `CAP_SYS_PTRACE` |

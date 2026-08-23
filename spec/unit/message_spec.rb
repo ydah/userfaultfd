@@ -15,4 +15,25 @@ RSpec.describe "userfaultfd message parsing" do
     expect(fault.flags).to eq([:write])
     expect(fault.thread_id).to eq(42)
   end
+
+  it "parses fixed memory-layout event messages" do
+    skip "Linux-only kernel structure" unless RUBY_PLATFORM.include?("linux")
+
+    remap = UserfaultFD.__send__(
+      :parse_message,
+      [UserfaultFD::UFFD_EVENT_REMAP, 0, 0, 0, 1, 2, 3].pack("CCS<L<Q<Q<Q<")
+    )
+    remove = UserfaultFD.__send__(
+      :parse_message,
+      [UserfaultFD::UFFD_EVENT_REMOVE, 0, 0, 0, 4, 5, 0].pack("CCS<L<Q<Q<Q<")
+    )
+    unmap = UserfaultFD.__send__(
+      :parse_message,
+      [UserfaultFD::UFFD_EVENT_UNMAP, 0, 0, 0, 6, 7, 0].pack("CCS<L<Q<Q<Q<")
+    )
+
+    expect([remap.from, remap.to, remap.length]).to eq([1, 2, 3])
+    expect([remove.start, remove.end]).to eq([4, 5])
+    expect([unmap.start, unmap.end]).to eq([6, 7])
+  end
 end

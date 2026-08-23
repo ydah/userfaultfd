@@ -43,3 +43,16 @@ No Ruby callback or Ruby-managed buffer is involved. These modes are the appropr
 - A handler monitors at most 64 fork descendants. An epoll-backed dynamic set is the upgrade path if external process fan-out exceeds that ceiling.
 - Native handlers currently service the descriptor on which they started; use the Ruby handler/event reader for fork descendants.
 - Always stop handlers before closing descriptors or unmapping regions.
+
+## Permission survey
+
+`vm.unprivileged_userfaultfd` is a host-kernel setting, not a reliable property of the userspace distribution. Current [upstream kernel documentation](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html#unprivileged-userfaultfd) and [Debian's packaged kernel documentation](https://sources.debian.org/src/linux/6.12.96-1/Documentation/admin-guide/sysctl/vm.rst) document a default of `0`: unprivileged callers must use `UFFD_USER_MODE_ONLY`. Ubuntu's [userfaultfd man page](https://manpages.ubuntu.com/manpages/jammy/man2/userfaultfd.2.html) likewise documents `EPERM` when the value is `0` and the caller lacks `CAP_SYS_PTRACE`.
+
+Cloud images, administrators, and container hosts can override that value, and containers observe the host kernel rather than the image's `/etc/os-release`. The gem therefore probes the real syscall instead of guessing from a distribution name. Diagnose a target with:
+
+```sh
+cat /proc/sys/vm/unprivileged_userfaultfd
+grep USERFAULTFD /boot/config-"$(uname -r)" 2>/dev/null
+```
+
+On Linux 5.11 and newer, the default `user_mode_only: true` remains usable when the sysctl is `0`. Linux 4.11–5.10 requires the explicitly less restrictive `user_mode_only: false` and whatever privilege or sysctl policy that kernel enforces.

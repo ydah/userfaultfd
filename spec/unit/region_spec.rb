@@ -24,6 +24,7 @@ RSpec.describe UserfaultFD::Region do
     region = described_class.new(size: page_size)
     expect { region.read(page_size, 1) }.to raise_error(RangeError)
     expect { region.write(page_size, "x") }.to raise_error(RangeError)
+    expect { region.madvise(:unknown) }.to raise_error(ArgumentError)
   ensure
     region&.unmap
   end
